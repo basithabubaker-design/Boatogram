@@ -1,0 +1,460 @@
+// Boatogram — Kerala houseboat & Shikara marketplace
+// Prisma schema: users/roles, owner KYC, boats, availability, bookings,
+// payments (Razorpay Route split), refunds, ledger, notifications, webhooks.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Users & Auth
+// ---------------------------------------------------------------------------
+
+enum Role {
+  CUSTOMER
+  OWNER
+  ADMIN
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  phone        String?
+  role         Role     @default(CUSTOMER)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  ownerProfile  OwnerProfile?
+  bookings      Booking[]        @relation("CustomerBookings")
+  notifications Notification[]
+  reviewedKyc   OwnerProfile[]   @relation("KycReviewedBy")
+
+  @@index([role])
+}
+
+// ---------------------------------------------------------------------------
+// Owner KYC / Admin approval
+// ---------------------------------------------------------------------------
+
+enum KycStatus {
+  NOT_SUBMITTED
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model OwnerProfile {
+  id             String    @id @default(cuid())
+  userId         String    @unique
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessName   String
+  bankAccountName   String?
+  bankAccountNumber String?
+  bankIfsc          String?
+  panNumber         String?
+
+  // Razorpay Route linked account for split settlement
+  razorpayAccountId     String?
+
+  kycStatus      KycStatus @default(NOT_SUBMITTED)
+  rejectionReason String?
+  submittedAt    DateTime?
+  reviewedAt     DateTime?
+  reviewedById   String?
+  reviewedBy     User?     @relation("KycReviewedBy", fields: [reviewedById], references: [id])
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  documents      KycDocument[]
+  boats          Boat[]
+  ledgerEntries  LedgerEntry[]
+
+  @@index([kycStatus])
+}
+
+model KycDocument {
+  id             String       @id @default(cuid())
+  ownerProfileId String
+  ownerProfile   OwnerProfile @relation(fields: [ownerProfileId], references: [id], onDelete: Cascade)
+  type           String
+  url            String
+  uploadedAt     DateTime     @default(now())
+
+  @@index([ownerProfileId])
+}
+
+// ---------------------------------------------------------------------------
+// Boats
+// ---------------------------------------------------------------------------
+
+enum BoatType {
+  HOUSEBOAT
+  SHIKARA
+}
+
+enum BoatStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+model Boat {
+  id             String     @id @default(cuid())
+  ownerId        String
+  owner          OwnerProfile @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  name           String
+  description    String
+  type           BoatType
+  location       String
+  latitude       Float?
+  longitude      Float?
+  capacity       Int
+  bedrooms       Int?
+  amenities      String[]   @default([])
+
+  // Overnight (houseboat) pricing — per night
+  basePriceOvernight Int?   // in paise
+  // Shikara hourly pricing
+  basePriceHourly    Int?   // in paise
+  minHours           Int?   @default(1)
+
+  status         BoatStatus @default(DRAFT)
+  rejectionReason String?
+  isActive       Boolean    @default(true)
+
+  cancellationPolicyId String?
+  cancellationPolicy   CancellationPolicy? @relation(fields: [cancellationPolicyId], references: [id])
+
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  images         BoatImage[]
+  blocks         AvailabilityBlock[]
+  bookings       Booking[]
+
+  @@index([ownerId])
+  @@index([status])
+  @@index([type])
+  @@index([location])
+}
+
+model BoatImage {
+  id       String @id @default(cuid())
+  boatId   String
+  boat     Boat   @relation(fields: [boatId], references: [id], onDelete: Cascade)
+  url      String
+  order    Int    @default(0)
+
+  @@index([boatId])
+}
+
+// Owner-defined maintenance/blackout windows (in addition to confirmed bookings)
+model AvailabilityBlock {
+  id        String   @id @default(cuid())
+  boatId    String
+  boat      Boat     @relation(fields: [boatId], references: [id], onDelete: Cascade)
+  startAt   DateTime
+  endAt     DateTime
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@index([boatId, startAt, endAt])
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation Policy (configurable, tiered by days-before-checkin)
+// ---------------------------------------------------------------------------
+
+model CancellationPolicy {
+  id        String                    @id @default(cuid())
+  name      String
+  isDefault Boolean                   @default(false)
+  createdAt DateTime                  @default(now())
+  updatedAt DateTime                  @updatedAt
+
+  tiers     CancellationPolicyTier[]
+  boats     Boat[]
+
+  @@index([isDefault])
+}
+
+// Tier semantics: if daysBeforeCheckin >= minDaysBefore, refundPercent applies.
+// Tiers are evaluated highest minDaysBefore first (first match wins).
+model CancellationPolicyTier {
+  id             String              @id @default(cuid())
+  policyId       String
+  policy         CancellationPolicy  @relation(fields: [policyId], references: [id], onDelete: Cascade)
+  minDaysBefore  Int
+  refundPercent  Int // 0-100
+
+  @@index([policyId])
+}
+
+// ---------------------------------------------------------------------------
+// Bookings
+// ---------------------------------------------------------------------------
+
+enum BookingType {
+  OVERNIGHT
+  SHIKARA_HOURLY
+}
+
+enum BookingStatus {
+  PENDING_PAYMENT
+  CONFIRMED
+  CANCELLED_BY_CUSTOMER
+  CANCELLED_BY_OWNER
+  COMPLETED
+  EXPIRED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+model Booking {
+  id              String        @id @default(cuid())
+  bookingNumber   String        @unique
+
+  customerId      String
+  customer        User          @relation("CustomerBookings", fields: [customerId], references: [id])
+
+  boatId          String
+  boat            Boat          @relation(fields: [boatId], references: [id])
+
+  bookingType     BookingType
+  startAt         DateTime
+  endAt           DateTime
+  guests          Int
+
+  // Snapshot pricing (immutable once created) — all amounts in paise
+  unitPrice       Int // price per night or per hour at time of booking
+  units           Int // nights or hours
+  subtotalAmount  Int
+  platformFeeAmount Int // 15% commission
+  ownerAmount     Int // 85% owner payout
+  totalAmount     Int
+  currency        String        @default("INR")
+
+  status          BookingStatus @default(PENDING_PAYMENT)
+  paymentStatus   PaymentStatus @default(PENDING)
+
+  cancelledAt     DateTime?
+  cancelledBy     String? // userId
+  cancellationReason String?
+  refundPercent   Int?
+  refundAmount    Int?
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  payments        Payment[]
+  refunds         RefundRecord[]
+  ledgerEntries   LedgerEntry[]
+
+  @@index([boatId, startAt, endAt])
+  @@index([customerId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Payments (Razorpay Route)
+// ---------------------------------------------------------------------------
+
+enum PaymentProvider {
+  RAZORPAY
+}
+
+enum PaymentRecordStatus {
+  CREATED
+  AUTHORIZED
+  PAID
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+model Payment {
+  id                 String              @id @default(cuid())
+  bookingId          String
+  booking            Booking             @relation(fields: [bookingId], references: [id])
+
+  provider           PaymentProvider     @default(RAZORPAY)
+  providerOrderId    String              @unique
+  providerPaymentId  String?
+  providerSignature  String?
+
+  amount             Int // paise
+  currency           String              @default("INR")
+  status             PaymentRecordStatus @default(CREATED)
+
+  rawPayload         Json?
+
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  splits             PaymentSplit[]
+  refunds            RefundRecord[]
+
+  @@index([bookingId])
+  @@index([providerOrderId])
+}
+
+enum SplitStatus {
+  PENDING
+  TRANSFERRED
+  FAILED
+}
+
+// Records the 15%/85% split for a captured payment (Razorpay Route transfer)
+model PaymentSplit {
+  id               String      @id @default(cuid())
+  paymentId        String
+  payment          Payment     @relation(fields: [paymentId], references: [id])
+
+  ownerId          String
+  platformAmount   Int // paise, retained by platform
+  ownerAmount      Int // paise, transferred to owner linked account
+
+  providerTransferId String?
+  status           SplitStatus @default(PENDING)
+  failureReason    String?
+
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  @@index([paymentId])
+  @@index([ownerId])
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+
+model RefundRecord {
+  id                 String       @id @default(cuid())
+  bookingId          String
+  booking            Booking      @relation(fields: [bookingId], references: [id])
+  paymentId          String
+  payment            Payment      @relation(fields: [paymentId], references: [id])
+
+  amount             Int // paise
+  reason             String?
+  policyRefundPercent Int
+  daysBeforeCheckin  Int
+
+  status             RefundStatus @default(PENDING)
+  providerRefundId   String?
+  failureReason      String?
+
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  @@index([bookingId])
+  @@index([paymentId])
+}
+
+// ---------------------------------------------------------------------------
+// Ledger (audit trail of platform commission & owner earnings)
+// ---------------------------------------------------------------------------
+
+enum LedgerEntryType {
+  OWNER_EARNING
+  PLATFORM_COMMISSION
+  REFUND_DEBIT_OWNER
+  REFUND_DEBIT_PLATFORM
+  PAYOUT
+  ADJUSTMENT
+}
+
+model LedgerEntry {
+  id          String          @id @default(cuid())
+  type        LedgerEntryType
+  amount      Int // paise; positive = credit, negative = debit
+  description String
+
+  bookingId   String?
+  booking     Booking?        @relation(fields: [bookingId], references: [id])
+
+  ownerId     String?
+  owner       OwnerProfile?   @relation(fields: [ownerId], references: [id])
+
+  createdAt   DateTime        @default(now())
+
+  @@index([ownerId])
+  @@index([bookingId])
+  @@index([type])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+enum NotificationType {
+  BOOKING_CONFIRMED
+  BOOKING_CANCELLED
+  BOOKING_REFUNDED
+  KYC_APPROVED
+  KYC_REJECTED
+  BOAT_APPROVED
+  BOAT_REJECTED
+  PAYOUT_PROCESSED
+  GENERIC
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String
+  isRead    Boolean          @default(false)
+  meta      Json?
+  createdAt DateTime         @default(now())
+
+  @@index([userId, isRead])
+}
+
+// ---------------------------------------------------------------------------
+// Webhook idempotency
+// ---------------------------------------------------------------------------
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+model WebhookEvent {
+  id           String        @id @default(cuid())
+  provider     PaymentProvider @default(RAZORPAY)
+  eventId      String        @unique // provider event id, used for idempotency
+  eventType    String
+  payload      Json
+  status       WebhookStatus @default(RECEIVED)
+  error        String?
+  receivedAt   DateTime      @default(now())
+  processedAt  DateTime?
+
+  @@index([eventType])
+}
